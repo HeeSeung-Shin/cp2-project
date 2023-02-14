@@ -38,6 +38,8 @@ from yolov8.ultralytics.yolo.utils.files import increment_path
 from yolov8.ultralytics.yolo.utils.torch_utils import select_device
 from yolov8.ultralytics.yolo.utils.ops import Profile, non_max_suppression, scale_boxes, process_mask, process_mask_native
 from yolov8.ultralytics.yolo.utils.plotting import Annotator, colors, save_one_box
+from reid.calc import calc_distance
+from reid.reid_onnx_helper import ReidHelper
 
 from trackers.multi_tracker_zoo import create_tracker
 
@@ -77,7 +79,30 @@ def run(
         dnn=False,  # use OpenCV DNN for ONNX inference
         vid_stride=1,  # video frame-rate stride
         retina_masks=False,
+        video_mask = None,
+        reid_model = None,
+        reid_threshold = None
 ):
+
+    threshold_dict = {'VeRi': 1.0, 'Vehicle_Id': 1.32, 'VERI_Wild': 1.05}
+
+    if video_mask != None:
+        mask = cv2.imread(video_mask)//255
+        mask = np.transpose(mask,(2,0,1))
+
+    if reid_model !=None:
+        reid = ReidHelper(reid_model)
+        query_lst = []
+        query_id = 0
+        feat1_dict = {}
+        frame_dict = {}
+    
+
+    if reid_model !=None:
+        try:
+            threshold= threshold_dict[reid_threshold]
+        except:
+            raise Exception("reid_threshold : ['VeRi', 'Vehicle_Id', 'VERI_Wild']")
 
     source = str(source)
     save_img = not nosave and not source.endswith('.txt')  # save inference images
@@ -148,6 +173,9 @@ def run(
         path, im, im0s, vid_cap, s = batch
         visualize = increment_path(save_dir / Path(path[0]).stem, mkdir=True) if visualize else False
         with dt[0]:
+            if video_mask != None: #157
+                im = im*mask
+            copy_im = im.copy()
             im = torch.from_numpy(im).to(device)
             im = im.half() if half else im.float()  # uint8 to fp16/32
             im /= 255.0  # 0 - 255 to 0.0 - 1.0
@@ -239,26 +267,89 @@ def run(
                         id = output[4]
                         cls = output[5]
                         conf = output[6]
+                            
 
-                        if save_txt:
-                            # to MOT format
-                            bbox_left = output[0]
-                            bbox_top = output[1]
-                            bbox_w = output[2] - output[0]
-                            bbox_h = output[3] - output[1]
+                        
+                        # to MOT format
+                        bbox_left = output[0]
+                        bbox_top = output[1]
+                        bbox_w = output[2] - output[0]
+                        bbox_h = output[3] - output[1]
                             # Write MOT compliant results to file
+                        if save_txt:
                             with open(txt_path + '.txt', 'a') as f:
+
                                 f.write(('%g ' * 10 + '\n') % (frame_idx + 1, id, bbox_left,  # MOT format
                                                                bbox_top, bbox_w, bbox_h, -1, -1, -1, i))
 
                         if save_vid or save_crop or show_vid:  # Add bbox/seg to image
-                            c = int(cls)  # integer class
-                            id = int(id)  # integer id
-                            label = None if hide_labels else (f'{id} {names[c]}' if hide_conf else \
-                                (f'{id} {conf:.2f}' if hide_class else f'{id} {names[c]} {conf:.2f}'))
-                            color = colors(c, True)
-                            annotator.box_label(bbox, label, color=color)
-                            
+                            if bbox_left >= 1320 and bbox_top <=400:
+                                if bbox_top <10 or bbox_h<350 or bbox_w < 350 and bbox_w>550:
+                                    continue
+                                else:
+                                    c = int(cls)  # integer class
+                                    id = int(id)  # integer id
+                                    label = None if hide_labels else f'{id} {names[c]}' 
+                                    color = colors(c, True)
+                                    if label not in query_lst:
+                                        query_lst.append(label)
+                                        query_id += 1
+                                    query_label = None if hide_labels else f'[{names[c]}: {query_id}]'
+                                    annotator.box_label(bbox, query_label, color=color)        
+                                    if query_label not in feat1_dict.keys():
+                                        query_img = copy_im[:,int(bbox_top):int(bbox_top+bbox_h),int(bbox_left):int(bbox_left+bbox_w)]
+                                        query_img = np.transpose(query_img,(1,2,0))
+                                        feat1 = reid.infer(query_img)
+                                        feat1_dict[query_label] = feat1 
+                                        frame_dict[query_label] = frame_idx
+                                if len(frame_dict) >0:
+                                    del_list = []
+                                    for lab, frame_index in frame_dict.items():
+                                        if frame_index+120 < frame_idx:
+                                            del_list.append(lab)
+                                for del_key in del_list:
+                                    frame_dict.pop(del_key)
+                                    feat1_dict.pop(del_key)
+                                            
+
+
+                            else:
+                                if len(feat1_dict) > 0:
+                                    distance_dict = {}
+                                    for lab, feat1 in feat1_dict.items():
+                                        gallery_img = copy_im[:,int(bbox_top):int(bbox_top+bbox_h),int(bbox_left):int(bbox_left+bbox_w)]
+                                        gallery_img = np.transpose(gallery_img,(1,2,0))
+                                        feat = reid.infer(gallery_img)
+
+                                        distance = calc_distance(feat1, feat)
+                                        distance_dict[lab] = distance
+
+                                    distance_dict = sorted(distance_dict.items(), key = lambda item: item[1])
+
+                                    label = distance_dict[0][0]
+                                    distance = distance_dict[0][1]
+
+                                    
+
+                                    if distance <= threshold:
+                                        color = colors(c, True)
+                                        annotator.box_label(bbox, label, color=color)    
+                                    else:
+                                        c = int(cls)  # integer class
+                                        id = int(id)  # integer id
+                                        label = None if hide_labels else (f'{id} {names[c]}' if hide_conf else \
+                                        (f'{id} {conf:.2f}' if hide_class else f'{id} {names[c]} {conf:.2f}'))
+                                        color = colors(c, True)
+                                        annotator.box_label(bbox, label, color=color)
+
+                                else:
+                                    c = int(cls)  # integer class
+                                    id = int(id)  # integer id
+                                    label = None if hide_labels else (f'{id} {names[c]}' if hide_conf else \
+                                    (f'{id} {conf:.2f}' if hide_class else f'{id} {names[c]} {conf:.2f}'))
+                                    color = colors(c, True)
+                                    annotator.box_label(bbox, label, color=color)
+
                             if save_trajectories and tracking_method == 'strongsort':
                                 q = output[7]
                                 tracker_list[i].trajectory(im0, q, color=color)
@@ -348,6 +439,9 @@ def parse_opt():
     parser.add_argument('--dnn', action='store_true', help='use OpenCV DNN for ONNX inference')
     parser.add_argument('--vid-stride', type=int, default=1, help='video frame-rate stride')
     parser.add_argument('--retina-masks', action='store_true', help='whether to plot masks in native resolution')
+    parser.add_argument('--video-mask', type=str, default=None, help='video mask image path')
+    parser.add_argument('--reid-model', type=str, default=None, help='reid model onnx path')
+    parser.add_argument('--reid-threshold', type=str, default=None, help='reid model name')
     opt = parser.parse_args()
     opt.imgsz *= 2 if len(opt.imgsz) == 1 else 1  # expand
     opt.tracking_config = ROOT / 'trackers' / opt.tracking_method / 'configs' / (opt.tracking_method + '.yaml')
